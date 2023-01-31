@@ -1,0 +1,137 @@
+import porespy as ps
+import glob, os
+import numpy as np
+import pandas as pd
+import cv2
+import matplotlib.pyplot as plt
+import itertools
+from skimage import io, filters, morphology, segmentation, exposure, img_as_ubyte
+from scipy import ndimage as ndi
+from sklearn.preprocessing import minmax_scale, MinMaxScaler
+
+
+def main():
+    # Function to move the 3D image axis and normalize between 0 and 1
+    def move_axis(im):
+        #move the axis1
+        return np.moveaxis(im, 0, -1)
+
+    # Normalize binary image between 0 and 1
+    def normalize(data):
+        return (data - np.min(data)) / (np.max(data) - np.min(data))
+
+    # Function to filter the image and perform segmentation
+    def denoiseSegment(noisy_im, size):
+        #filter for noise suppression  with small odd number kernel
+        #noisy_im = ndi.gaussian_filter(noisy_im, sigma=sig)
+        
+        noisy_im = ndi.median_filter(noisy_im, size=size)
+
+        ndi.binary_erosion(noisy_im, iterations=1)
+        # remove pixels on the border
+        segmentation.clear_border(noisy_im)
+
+        # Threshold image to binary using Otsu
+        return noisy_im > (filters.threshold_otsu(noisy_im))
+
+
+    # function to crop
+    # get coordinates of furthest pixes and form bounding box
+    def bbox_3D(bb_img):
+        N = img.ndim
+        out = []
+        for ax in itertools.combinations(reversed(range(N)), N-1):
+            nonzero = np.any(bb_img, axis=ax)
+            out.extend(np.where(nonzero)[0][[0, -1]])
+        return tuple(out)
+
+    fname_list = []
+    label_list = []
+    av_list = []
+
+    PATH = "sun2/test/test/*.tif"
+
+    # load images using glob
+    for file in sorted(glob.glob(PATH)):
+        print(file)
+        #read file
+        img = io.imread(file)
+
+        #get the file names
+        fname = os.path.basename(file).replace('.tif', '')
+        print('current file name is:', fname)
+        #add file to list
+        fname_list.append(fname)
+
+        #Split a string and get the second element the label
+        label = fname.split('_', 2)[0]
+        print('label is', label)
+        label_list.append(label)
+
+        #images_list.append(img)
+        folder = os.path.split(os.path.split(PATH)[0])[1]
+        print('folder name is:', folder)
+
+        #move axis and normalize
+        #img = move_axis(img)
+        img = normalize(img)
+        print('move axis and normalize')
+        print('image shape:', img.shape)
+
+        print('segmenting...')
+        #filter the image and perform segmentation for mask
+        seg_img = denoiseSegment(img, size=2)
+
+        # crop the segmented image
+        a = bbox_3D(seg_img)
+        print('coordinates for cropping are:', a)
+        # mask the coordinates with the segmented image
+        crop_img = img[a[0]:a[1], (a[2]):(a[3]), (a[4]):(a[5])]
+
+        # clip pixels in lowest and highest extremes to improve
+        vmin, vmax = np.quantile(crop_img, q=(0.005, 0.995))
+        crop_img = exposure.rescale_intensity(
+            crop_img, in_range=(vmin, vmax), out_range=np.float32)
+
+        # Edge detection for regions with sharp change in contrast
+        crop_img = crop_img > (filters.threshold_otsu(crop_img))
+        im = img_as_ubyte(crop_img)
+        #im = filters.sobel(crop_img)
+
+        #io.imsave("edge_im.tif", edges)
+        # converts to partitioned regions while avoiding oversegmentation
+        snow = ps.filters.snow_partitioning(im=im)
+        regions = snow.regions*snow.im
+        # regions properties for 3D image
+        props = ps.metrics.regionprops_3D(regions)
+
+        df = ps.metrics.props_to_DataFrame(props)
+
+        # mean saved to list for dataframe 
+        av = df.mean(axis=0)
+        av_list.append(av)
+        df_av = pd.DataFrame(av_list)
+
+        # normalize
+        #names = df_av.columns
+        #df_av = pd.DataFrame(MinMaxScaler().fit_transform(df_av), columns=names)
+        # get unique column names
+        #n = df_av.columns[0]
+        df_av[df_av.columns[0]] = label_list
+        # average of each label condition
+        df_av = df_av.groupby(['label']).mean().reset_index()
+        # drop repeated data
+        #df_av = df_av.drop(df_av.columns[[0, 1, 4, 5, 6, 9]], axis=1)
+        print(df_av)
+        # properties to plot
+        y = ['surface_area', 'sphericity', 'axis_major_length','axis_minor_length']
+        #ylim = (0, 1)
+        #df_av.to_csv(folder+"_dataframe.csv", encoding='utf-8', index=False)
+
+        df2 = df_av[y]
+        fig, a = plt.subplots(2, 2, figsize=(9, 6))
+        df2.plot(ax=a, subplots=True, kind='bar') # , ylim=ylim
+    plt.show()
+
+if __name__ == "__main__":
+    main()
