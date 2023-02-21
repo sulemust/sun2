@@ -1,0 +1,187 @@
+import porespy as ps
+import glob
+import os
+import numpy as np
+import pandas as pd
+import math
+import matplotlib.pyplot as plt
+from skimage import io, filters, segmentation, exposure, measure,morphology, img_as_ubyte
+from scipy import ndimage as ndi
+from skimage.measure import label, regionprops, regionprops_table
+
+
+def main():
+    # Function to move the 3D image axis and normalize between 0 and 1
+    def move_axis(im):
+        # move the axis1
+        return np.moveaxis(im, 0, -1)
+
+    # Normalize binary image between 0 and 1
+    def normalize(data):
+        return (data - np.min(data)) / (np.max(data) - np.min(data))
+
+       # Function to filter the image and perform segmentation
+    def denoiseSegment(noisy_im, size):
+        # filter for noise suppression  with small odd number kernel
+        
+        noisy_im = ndi.median_filter(noisy_im, size=size)
+        #noisy_im = ndi.gaussian_filter(noisy_im, sigma=3)
+
+        # Adaptive Equalization
+        #noisy_im = exposure.equalize_adapthist(noisy_im, clip_limit=0.01)
+
+        return noisy_im > (filters.threshold_otsu(noisy_im))
+
+    # clear the objects touching the sides of the volume, but not the top and bottom
+    def clear(seg_im):
+        seg_im = np.pad(seg_im, ((0, 0), (0, 0), (1, 1)), mode='constant', constant_values=0)
+        seg_im = segmentation.clear_border(seg_im)[1:-1]
+
+        # clear small objects
+        seg_im = ndi.binary_dilation(ndi.binary_erosion((ndi.binary_dilation
+                                     (seg_im, iterations=5)), iterations=10),
+                                     iterations=20)
+        # fill up spaces after dilation
+        stru=(5, 5, 5)
+        return ndi.binary_fill_holes(seg_im, structure=np.ones(stru))
+
+    # lists to store file names, labels and average values
+    fname_list = []
+    label_list = []
+    av_list = []
+
+    PATH = "sun2/MCF10A/*.tif"
+
+    # load images using glob
+    for file in sorted(glob.glob(PATH)):
+        print(file)
+        # read file
+        img = io.imread(file)
+
+        # get the file names
+        fname = os.path.basename(file).replace('.tif', '')
+        print('current file name is:', fname)
+        # add file to list
+        fname_list.append(fname)
+
+        # split a string and get the second element the label
+        label = fname.split('_', 2)[0]
+        print('label is', label)
+        label_list.append(label)
+
+        folder = os.path.split(os.path.split(PATH)[0])[1]
+        print('folder name is:', folder)
+
+        # move axis and normalize
+        img = move_axis(img)
+        img = normalize(img)
+        print('move axis and normalize')
+        print('image shape:', img.shape)
+
+        # width 0.0519043µ, height 0.0519043µ and voxel depth 0.2108307µ
+        sampling = (1, 1, 4)
+        img = ndi.zoom(img, (sampling))
+
+        print('segmenting...')
+        # filter the image and perform segmentation for mask
+        seg_im = denoiseSegment(img, size=5)
+
+        # clear cells on border
+        clean_im = clear(seg_im)
+        print('clean image shape:', clean_im.shape)
+
+        # use mask on original image with clear boder pad
+        im = np.pad(img[1:-1], ((0, 0), (0, 0), (1, 1)), mode='constant',
+                    constant_values=0)
+        
+        # increase contrast by clipping darkest and brightest 0.5% of pixels
+        vmin, vmax = np.percentile(im, q=(5.0, 95.0))
+        im = exposure.rescale_intensity(im, in_range=(vmin, vmax), out_range=np.float32)
+        # edge detection
+        im = filters.sobel(im)
+        mask_im = np.where(clean_im, im, 0)
+
+        # Threshold image to binary using Otsu
+        binary_im = img_as_ubyte(mask_im > (filters.threshold_otsu(mask_im)))
+
+        # label the connected components
+        print('labeling...')
+        label_im = measure.label(binary_im)
+
+        # label the connected components
+        snow = ps.filters.snow_partitioning(im=label_im)
+        #regions = snow.regions*snow.im
+        regions = ps.metrics.regionprops_3D(snow.regions*snow.im)
+
+        # visualize these processing steps in a sequence of subplots
+        z_plane = 50
+        fig, ax = plt.subplots(1, 5, figsize=(12, 6), sharey=True)
+
+        ax[0].imshow(img[:, :, z_plane], cmap=plt.cm.gray)
+        ax[0].set_title('a) Raw')
+
+        ax[1].imshow(seg_im[:, :, z_plane], cmap=plt.cm.gray)
+        ax[1].set_title('b) Threshold')
+
+        ax[2].imshow(clean_im[:, :, z_plane], cmap=plt.cm.gray)
+        ax[2].set_title('c) Fill in')
+
+        ax[3].imshow(mask_im[:, :, z_plane], cmap=plt.cm.gray)
+        ax[3].set_title('d) Masked')
+
+        ax[4].imshow(binary_im[:, :, z_plane], cmap=plt.cm.gray)
+        ax[4].set_title('e) Regions')
+
+        for a in ax.ravel():
+            a.set_axis_off()
+
+        fig.tight_layout()
+        plt.savefig('sun2/out/'+fname+"_sequence.png")
+
+        # properties to find
+        ppts = ['label', 'volume', 'sphericity', 'surface_area', 'area',
+                'axis_major_length', 'axis_minor_length']
+
+        # df = pd.DataFrame(measure.regionprops_table(label_im, properties = ppts))
+
+        df = ps.metrics.props_to_DataFrame(regions)
+
+        # exclude the nuclues' countour
+        df = df[df['area'] < 1000]
+        
+        df.to_csv(folder+"_info_table.csv", encoding='utf-8', index=False)
+    #     # regions properties for 3D image
+    #     #df = ps.metrics.props_to_DataFrame(regions)
+    #     df = regionprops_table(regions)
+        
+    #     # mean saved to list for dataframe
+        av = df.mean(axis=0)
+        av_list.append(av)
+        df_av = pd.DataFrame(av_list)
+        df_av.to_csv(folder+"_info_table2.csv", encoding='utf-8', index=False)
+        
+    #     # get unique column names
+        df_av[df_av.columns[0]] = label_list
+        # average of each label condition
+        errors = df_av.groupby(['label']).std().reset_index()
+        # standard diviation for each label condition
+        df_av = df_av.groupby(['label']).mean().reset_index()
+      
+        # change index column to label for plotting
+        df_av.set_index('label', inplace=True)
+        errors.set_index('label', inplace=True)
+
+        
+        # df_av.to_csv(folder+"_dataframe.csv", encoding='utf-8', index=False)
+
+    # plot selected properties in dataframe and corresponding std errors
+    fig, ax = plt.subplots(2, 3, figsize=(9, 6), constrained_layout=True)
+    bars = df_av[ppts[1:]].plot(yerr=errors[ppts[1:]], ax=ax,
+                                subplots=True, kind='bar', ylabel='size',
+                                title=folder+ ' - Comparison of Control (No DTT) vs DTT 1uM 30mins', rot=0)
+
+    plt.savefig(folder+"_sun2.png", bbox_inches='tight')
+    plt.show()
+
+if __name__ == "__main__":
+    main()
